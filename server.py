@@ -5,6 +5,7 @@ import os
 
 from fastapi import FastAPI, HTTPException, Query, Path, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field, constr
 from dotenv import load_dotenv
 
@@ -41,6 +42,7 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None)):
 class ConversationIn(BaseModel):
     user_name: constr(min_length=1, max_length=200) = Field(..., description="Nom d'utilisateur de la session")
     conversation: constr(min_length=1) = Field(..., description="Transcript complet au format plat")
+    sujet: Optional[constr(max_length=200)] = Field(None, description="Nom de l'assistant ou sujet de la conversation")
     date_conversation: Optional[datetime] = Field(
         None,
         description="Horodatage ISO 8601 (UTC recommandé). Si absent, défini par le serveur."
@@ -53,12 +55,14 @@ class ConversationOut(BaseModel):
 class ConversationSummary(BaseModel):
     id: int
     user_name: str
+    sujet: Optional[str]
     date_conversation: datetime
     preview: str
 
 class ConversationDetail(BaseModel):
     id: int
     user_name: str
+    sujet: Optional[str]
     date_conversation: datetime
     conversation: str
 
@@ -86,18 +90,18 @@ def save_conversation(payload: ConversationIn):
 
         cur.execute(
             """
-            INSERT INTO conversations (user_name, conversation, date_conversation)
-            VALUES (%s, %s, %s)
+            INSERT INTO conversations (user_name, conversation, sujet, date_conversation)
+            VALUES (%s, %s, %s, %s)
             RETURNING id;
             """,
-            (payload.user_name.strip(), payload.conversation, date_conv),
+            (payload.user_name.strip(), payload.conversation, payload.sujet, date_conv),
         )
         new_id = cur.fetchone()[0]
         conn.commit()
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
         return ConversationOut(id=new_id, status="ok")
     except Exception as e:
-        # log e si besoin
         raise HTTPException(status_code=500, detail=f"Insertion échouée: {e}")
 
 
@@ -106,6 +110,7 @@ def save_conversation(payload: ConversationIn):
 # ---------------------------
 @app.get("/conversations", dependencies=[require_api_key] if API_KEY else [])
 def list_conversations(
+    sujet: str = Query(..., max_length=200, description="Filtre par sujet/assistant (requis)"),
     date: Optional[str] = Query(None, description="YYYY-MM-DD (UTC)"),
     user_name: Optional[str] = Query(None, max_length=200),
     limit: int = Query(50, ge=1, le=200),
@@ -115,20 +120,22 @@ def list_conversations(
         conn = get_connection()
         cur = conn.cursor()
 
-        where, params = [], []
+        # sujet est maintenant obligatoire
+        where = ["LOWER(sujet) = %s"]
+        params = [sujet.lower()]
+        
         if date:
-            # match sur la partie date en UTC
             where.append("DATE(date_conversation AT TIME ZONE 'UTC') = %s")
             params.append(date)
         if user_name:
             where.append("LOWER(user_name) LIKE %s")
             params.append(f"%{user_name.lower()}%")
 
-        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        where_sql = "WHERE " + " AND ".join(where)
 
         cur.execute(
             f"""
-            SELECT id, user_name, date_conversation, conversation
+            SELECT id, user_name, sujet, date_conversation, conversation
             FROM conversations
             {where_sql}
             ORDER BY date_conversation DESC, id DESC
@@ -142,15 +149,15 @@ def list_conversations(
         total = cur.fetchone()[0]
 
         items: List[ConversationSummary] = []
-        for (cid, uname, dconv, conv) in rows:
-            # aperçu: début du champ conversation (plat) – coupe propre
+        for (cid, uname, suj, dconv, conv) in rows:
             preview = (conv[:160] + "…") if len(conv) > 160 else conv
             items.append(ConversationSummary(
-                id=cid, user_name=uname, date_conversation=dconv, preview=preview
+                id=cid, user_name=uname, sujet=suj, date_conversation=dconv, preview=preview
             ))
 
-        cur.close(); conn.close()
-        return {"items": [i.model_json_schema() and i.dict() for i in items], "total": total}
+        cur.close()
+        conn.close()
+        return {"items": [i.dict() for i in items], "total": total}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Query failed: {e}")
 
@@ -159,22 +166,33 @@ def list_conversations(
 # Get conversation by id
 # ---------------------------
 @app.get("/conversations/{id}", response_model=ConversationDetail, dependencies=[require_api_key] if API_KEY else [])
-def get_conversation_by_id(id: int = Path(..., ge=1)):
+def get_conversation_by_id(
+    id: int = Path(..., ge=1),
+    sujet: str = Query(..., max_length=200, description="Sujet/assistant (requis)")
+):
     try:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, user_name, date_conversation, conversation
-            FROM conversations WHERE id=%s;
+            SELECT id, user_name, sujet, date_conversation, conversation
+            FROM conversations 
+            WHERE id=%s AND LOWER(sujet) = %s;
             """,
-            (id,),
+            (id, sujet.lower()),
         )
         row = cur.fetchone()
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
         if not row:
             raise HTTPException(status_code=404, detail="Conversation not found")
-        return ConversationDetail(id=row[0], user_name=row[1], date_conversation=row[2], conversation=row[3])
+        return ConversationDetail(
+            id=row[0], 
+            user_name=row[1], 
+            sujet=row[2], 
+            date_conversation=row[3], 
+            conversation=row[4]
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -184,17 +202,22 @@ def get_conversation_by_id(id: int = Path(..., ge=1)):
 # ---------------------------
 # Export TXT
 # ---------------------------
-from fastapi.responses import PlainTextResponse
-
 @app.get("/conversations/{id}/export.txt", response_class=PlainTextResponse,
          dependencies=[require_api_key] if API_KEY else [])
-def export_conversation_txt(id: int = Path(..., ge=1)):
+def export_conversation_txt(
+    id: int = Path(..., ge=1),
+    sujet: str = Query(..., max_length=200, description="Sujet/assistant (requis)")
+):
     try:
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("SELECT conversation FROM conversations WHERE id=%s;", (id,))
+        cur.execute(
+            "SELECT conversation FROM conversations WHERE id=%s AND LOWER(sujet) = %s;", 
+            (id, sujet.lower())
+        )
         row = cur.fetchone()
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
         if not row:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
