@@ -43,6 +43,7 @@ class ConversationIn(BaseModel):
     user_name: constr(min_length=1, max_length=200) = Field(..., description="Nom d'utilisateur de la session")
     conversation: constr(min_length=1) = Field(..., description="Transcript complet au format plat")
     sujet: Optional[constr(max_length=200)] = Field(None, description="Nom de l'assistant ou sujet de la conversation")
+    client_name: Optional[constr(max_length=200)] = Field(None, description="Nom du client")
     date_conversation: Optional[datetime] = Field(
         None,
         description="Horodatage ISO 8601 (UTC recommandé). Si absent, défini par le serveur."
@@ -56,6 +57,7 @@ class ConversationSummary(BaseModel):
     id: int
     user_name: str
     sujet: Optional[str]
+    client_name: Optional[str]
     date_conversation: datetime
     preview: str
 
@@ -63,6 +65,7 @@ class ConversationDetail(BaseModel):
     id: int
     user_name: str
     sujet: Optional[str]
+    client_name: Optional[str]
     date_conversation: datetime
     conversation: str
 
@@ -90,11 +93,11 @@ def save_conversation(payload: ConversationIn):
 
         cur.execute(
             """
-            INSERT INTO conversations (user_name, conversation, sujet, date_conversation)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO conversations (user_name, conversation, sujet, client_name, date_conversation)
+            VALUES (%s, %s, %s, %s, %s)
             RETURNING id;
             """,
-            (payload.user_name.strip(), payload.conversation, payload.sujet, date_conv),
+            (payload.user_name.strip(), payload.conversation, payload.sujet, payload.client_name, date_conv),
         )
         new_id = cur.fetchone()[0]
         conn.commit()
@@ -113,6 +116,7 @@ def list_conversations(
     sujet: str = Query(..., max_length=200, description="Filtre par sujet/assistant (requis)"),
     date: Optional[str] = Query(None, description="YYYY-MM-DD (UTC)"),
     user_name: Optional[str] = Query(None, max_length=200),
+    client_name: Optional[str] = Query(None, max_length=200),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
@@ -130,12 +134,15 @@ def list_conversations(
         if user_name:
             where.append("LOWER(user_name) LIKE %s")
             params.append(f"%{user_name.lower()}%")
+        if client_name:
+            where.append("LOWER(client_name) LIKE %s")
+            params.append(f"%{client_name.lower()}%")
 
         where_sql = "WHERE " + " AND ".join(where)
 
         cur.execute(
             f"""
-            SELECT id, user_name, sujet, date_conversation, conversation
+            SELECT id, user_name, sujet, client_name, date_conversation, conversation
             FROM conversations
             {where_sql}
             ORDER BY date_conversation DESC, id DESC
@@ -149,10 +156,10 @@ def list_conversations(
         total = cur.fetchone()[0]
 
         items: List[ConversationSummary] = []
-        for (cid, uname, suj, dconv, conv) in rows:
+        for (cid, uname, suj, cname, dconv, conv) in rows:
             preview = (conv[:160] + "…") if len(conv) > 160 else conv
             items.append(ConversationSummary(
-                id=cid, user_name=uname, sujet=suj, date_conversation=dconv, preview=preview
+                id=cid, user_name=uname, sujet=suj, client_name=cname, date_conversation=dconv, preview=preview
             ))
 
         cur.close()
@@ -175,7 +182,7 @@ def get_conversation_by_id(
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, user_name, sujet, date_conversation, conversation
+            SELECT id, user_name, sujet, client_name, date_conversation, conversation
             FROM conversations 
             WHERE id=%s AND LOWER(sujet) = %s;
             """,
@@ -189,9 +196,10 @@ def get_conversation_by_id(
         return ConversationDetail(
             id=row[0], 
             user_name=row[1], 
-            sujet=row[2], 
-            date_conversation=row[3], 
-            conversation=row[4]
+            sujet=row[2],
+            client_name=row[3],
+            date_conversation=row[4], 
+            conversation=row[5]
         )
     except HTTPException:
         raise
@@ -228,3 +236,55 @@ def export_conversation_txt(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Export failed: {e}")
+
+
+# ---------------------------
+# Get conversations by client
+# ---------------------------
+@app.get("/conversations/by-client/{client_name}", dependencies=[require_api_key] if API_KEY else [])
+def get_conversations_by_client(
+    client_name: str = Path(..., min_length=1, max_length=200, description="Nom du client"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        
+        # Query with client name filter
+        cur.execute(
+            """
+            SELECT id, user_name, sujet, client_name, date_conversation, conversation
+            FROM conversations 
+            WHERE LOWER(client_name) LIKE %s
+            ORDER BY date_conversation DESC, id DESC
+            LIMIT %s OFFSET %s;
+            """,
+            (f"%{client_name.lower()}%", limit, offset),
+        )
+        rows = cur.fetchall()
+
+        # Get total count
+        cur.execute(
+            "SELECT COUNT(*) FROM conversations WHERE LOWER(client_name) LIKE %s;",
+            (f"%{client_name.lower()}%",)
+        )
+        total = cur.fetchone()[0]
+
+        items: List[ConversationSummary] = []
+        for (cid, uname, suj, cname, dconv, conv) in rows:
+            preview = (conv[:160] + "…") if len(conv) > 160 else conv
+            items.append(ConversationSummary(
+                id=cid, 
+                user_name=uname, 
+                sujet=suj, 
+                client_name=cname,
+                date_conversation=dconv, 
+                preview=preview
+            ))
+
+        cur.close()
+        conn.close()
+        return {"items": [i.dict() for i in items], "total": total}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
